@@ -1,0 +1,100 @@
+name: Build and Publish Harbor Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit SHA to build'
+        required: true
+        default: 'dev'
+      image_tag:
+        description: 'Docker image tag (defaults to latest)'
+        required: false
+        default: 'latest'
+  push:
+    branches:
+      - dev
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          TZ: Etc/UTC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends make docker-compose
+
+      - name: Compile Harbor Binaries
+        run: |
+          make compile
+
+      - name: Set image tag
+        id: set_tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            IMAGE_TAG=${{ github.event.inputs.image_tag }}
+          fi
+
+          if [ -z "$IMAGE_TAG" ]; then
+            IMAGE_TAG="latest"
+          fi
+
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Build Harbor Images
+        run: |
+          make build -e VERSIONTAG=${{ env.IMAGE_TAG }} \
+                     -e DEVFLAG=true \
+                     -e PULL_BASE_FROM_DOCKERHUB=true \
+                     -e BUILD_BASE=false \
+                     -e PUSHBASEIMAGE=false
+
+      - name: List built images
+        run: |
+          echo "Successfully built Harbor images:"
+          docker images | grep "goharbor"
+
+      - name: Tag and Push Harbor Images to GitHub Container Registry
+        shell: bash
+        env:
+          REGISTRY: ghcr.io
+          HARBOR_REPOSITORY: ${{ github.repository_owner }}/harbor
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
+
+          COMPONENTS=("core" "portal" "jobservice" "log" "db" "registryctl" "exporter" "registry" "nginx" "redis" "prepare")
+          PHOTON_COMPONENTS=("redis" "nginx" "registry")
+
+          for component in "${COMPONENTS[@]}"; do
+            src_image="goharbor/harbor-$component:$IMAGE_TAG"
+
+            if [[ " ${PHOTON_COMPONENTS[@]} " =~ " ${component} " ]]; then
+              src_image="goharbor/${component}-photon:$IMAGE_TAG"
+            fi
+
+            if [ "$component" == "prepare" ]; then
+              src_image="goharbor/prepare:$IMAGE_TAG"
+            fi
+
+            dest_image="$REGISTRY/$HARBOR_REPOSITORY-$component:$IMAGE_TAG"
+            echo "Processing: $src_image → $dest_image"
+            docker tag "$src_image" "$dest_image"
+            docker push "$dest_image"
+          done
